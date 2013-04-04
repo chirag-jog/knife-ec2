@@ -62,6 +62,10 @@ class Chef
         :description => "The security group ids for this server; required when using VPC",
         :proc => Proc.new { |security_group_ids| security_group_ids.split(',') }
 
+      option :associate_eip,
+        :long => "--associate-eip IP_ADDRESS",
+        :description => "Associate existing elastic IP address with instance after launch"
+
       option :tags,
         :short => "-T T=V[,T=V,...]",
         :long => "--tags Tag=Value[,Tag=Value...]",
@@ -109,7 +113,6 @@ class Chef
         :long => "--ssh-gateway GATEWAY",
         :description => "The ssh gateway server",
         :proc => Proc.new { |key| Chef::Config[:knife][:ssh_gateway] = key }
-
 
       option :identity_file,
         :short => "-i IDENTITY_FILE",
@@ -166,6 +169,11 @@ class Chef
         :long => "--subnet SUBNET-ID",
         :description => "create node in this Virtual Private Cloud Subnet ID (implies VPC mode)",
         :proc => Proc.new { |key| Chef::Config[:knife][:subnet_id] = key }
+
+      option :private_ip_address,
+        :long => "--private-ip-address IP-ADDRESS",
+        :description => "allows to specify the private IP address of the instance in VPC mode",
+        :proc => Proc.new { |ip| Chef::Config[:knife][:private_ip_address] = ip }
 
       option :host_key_verify,
         :long => "--[no-]host-key-verify",
@@ -225,6 +233,11 @@ class Chef
 
         validate!
 
+        requested_elastic_ip = config[:associate_eip] if config[:associate_eip]
+
+        # For VPC EIP assignment we need the allocation ID so fetch full EIP details
+        elastic_ip = connection.addresses.detect{|addr| addr if addr.public_ip == requested_elastic_ip}
+
         @server = connection.servers.create(create_server_def)
 
         hashed_tags={}
@@ -265,10 +278,18 @@ class Chef
         # wait for it to be ready to do stuff
         @server.wait_for { print "."; ready? }
 
+        if config[:associate_eip]
+          connection.associate_address(server.id, elastic_ip.public_ip, nil, elastic_ip.allocation_id)
+          @server.wait_for { public_ip_address == elastic_ip.public_ip }
+        end
+
         puts("\n")
 
         if vpc_mode?
           msg_pair("Subnet ID", @server.subnet_id)
+          if elastic_ip
+            msg_pair("Public IP Address", @server.public_ip_address)
+          end
         else
           msg_pair("Public DNS Name", @server.dns_name)
           msg_pair("Public IP Address", @server.public_ip_address)
@@ -373,7 +394,19 @@ class Chef
           ui.error("You are using a VPC, security groups specified with '-G' are not allowed, specify one or more security group ids with '-g' instead.")
           exit 1
         end
+        if !vpc_mode? and !!config[:private_ip_address]
+          ui.error("You can only specify a private IP address if you are using VPC.")
+          exit 1
+        end
 
+        if config[:associate_eip]
+          eips = connection.addresses.collect{|addr| addr if addr.domain == eip_scope}.compact
+
+          unless eips.detect{|addr| addr.public_ip == config[:associate_eip] && addr.server_id == nil}
+            ui.error("Elastic IP requested is not available.")
+            exit 1
+          end
+        end
       end
 
       def tags
@@ -383,6 +416,14 @@ class Chef
           exit 1
         end
        tags
+      end
+
+      def eip_scope
+        if vpc_mode?
+          "vpc"
+        else
+          "standard"
+        end
       end
 
       def create_server_def
@@ -395,6 +436,7 @@ class Chef
           :availability_zone => locate_config_value(:availability_zone)
         }
         server_def[:subnet_id] = locate_config_value(:subnet_id) if vpc_mode?
+        server_def[:private_ip_address] = locate_config_value(:private_ip_address) if vpc_mode?
 
         if Chef::Config[:knife][:aws_user_data]
           begin
